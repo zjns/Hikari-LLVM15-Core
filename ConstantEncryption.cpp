@@ -18,6 +18,7 @@
 #include "llvm/Transforms/Obfuscation/ConstantEncryption.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -210,6 +211,7 @@ struct ConstantEncryption : public ModulePass {
   }
 
   void EncryptConstants(Function &F) {
+    SmallVector<Instruction *, 8> InlineAsmInstructions;
     for (Instruction &I : instructions(F)) {
       if (!shouldEncryptConstant(&I))
         continue;
@@ -226,6 +228,12 @@ struct ConstantEncryption : public ModulePass {
               isa<ConstantInt>(G->getInitializer()))
             HandleConstantIntInitializerGV(G);
       }
+      if (IsInlineAsmInstruction(&I)) {
+        InlineAsmInstructions.push_back(&I);
+      }
+    }
+    for (Instruction *I : InlineAsmInstructions) {
+      ModifyConstraintFromConstantIntToRegisterIfNeed(I);
     }
   }
 
@@ -356,6 +364,50 @@ struct ConstantEncryption : public ModulePass {
     if (SubstituteXorTemp &&
         cryptoutils->get_range(100) <= SubstituteXorProbTemp)
       SubstituteImpl::substituteXor(NewOperand);
+  }
+
+  bool IsInlineAsmInstruction(Instruction *I) {
+    CallInst *OldCall = dyn_cast<CallInst>(I);
+    return OldCall && dyn_cast<InlineAsm>(OldCall->getCalledOperand());
+  }
+
+  void ModifyConstraintFromConstantIntToRegisterIfNeed(Instruction *I) {
+    if (CallInst *OldCall = dyn_cast<CallInst>(I);
+        InlineAsm *OldIA = dyn_cast<InlineAsm>(OldCall->getCalledOperand())) {
+      std::string Constraint = OldIA->getConstraintString();
+      size_t Pos = 0;
+      std::string NewConstraint(Constraint);
+      while (Pos != std::string::npos && Pos < NewConstraint.size()) {
+        size_t NextCommaPos = NewConstraint.find(',', Pos);
+        if (NextCommaPos == std::string::npos) {
+          NextCommaPos = NewConstraint.size();
+        }
+        if (NewConstraint.substr(Pos, NextCommaPos - Pos) == "i") {
+          NewConstraint.replace(Pos, 1, "r");
+        }
+        Pos = NextCommaPos + 1;
+      }
+      if (Constraint == NewConstraint)
+        return;
+      InlineAsm *NewIA = InlineAsm::get(
+          OldIA->getFunctionType(), OldIA->getAsmString(), NewConstraint,
+          OldIA->hasSideEffects(), OldIA->isAlignStack(), OldIA->getDialect(),
+          OldIA->canThrow());
+      SmallVector<Value *, 8> NewArgs(OldCall->args());
+      IRBuilder<> Builder(OldCall);
+      CallInst *NewCall = Builder.CreateCall(NewIA, NewArgs);
+      NewCall->setTailCallKind(OldCall->getTailCallKind());
+      NewCall->setAttributes(OldCall->getAttributes());
+      if (OldCall->hasMetadata()) {
+        SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
+        OldCall->getAllMetadata(MDs);
+        for (auto &MD : MDs) {
+          NewCall->setMetadata(MD.first, MD.second);
+        }
+      }
+      OldCall->replaceAllUsesWith(NewCall);
+      OldCall->eraseFromParent();
+    }
   }
 
   std::pair<ConstantInt * /*key*/, ConstantInt * /*new*/>
